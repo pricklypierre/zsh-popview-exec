@@ -92,7 +92,7 @@ Before calling `pv_exec` you can set the following variables to customize the po
 - The bordered view does its best to handle double-width characters, but the right border may render one column off on lines containing them, or output lines might be truncated.
 - Recursive calls to `pv_exec` are not supported (limitation of using  zsh `coproc`).
 - Designed for interactive TTYs; when stdout is not a TTY, behavior is undefined/untested.
-
+- Basic keyboard input is supported (backspace) but cursor movement and other complex terminal interactions are not supported.
 ---
 ## License
 
