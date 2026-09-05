@@ -612,6 +612,39 @@ _render_label_failure() {
     return 0
 }
 
+# Filter complete lines so escape sequences split across reads remain intact.
+# Strip the CR in CRLF before strip_control_chars(), which treats CR as a redraw.
+_pv_filter_log() {
+    local log_line="" log_text=""
+    local -i read_rc=0
+    while true; do
+        IFS= read -r log_line
+        read_rc=$?
+        (( read_rc != 0 )) && [[ -z "$log_line" ]] && break
+        strip_control_chars "${log_line%$'\r'}" log_text
+        if (( read_rc == 0 )); then
+            print -r -- "$log_text" || return $?
+        else
+            print -rn -- "$log_text" || return $?
+            break
+        fi
+    done
+    return 0
+}
+
+_pv_tee_log() {
+    setopt localoptions multios pipefail
+    local log_display_fd
+    exec {log_display_fd}>&1 || return $?
+    # With zsh MULTIOS, cat writes to BOTH the pipe and the saved stdout.
+    # Only the log branch buffers lines; prompts reach the popview immediately.
+    # The foreground pipeline waits for the filter to flush its final fragment.
+    cat >&$log_display_fd | _pv_filter_log >> "$1"
+    local -i log_rc=$?
+    exec {log_display_fd}>&-
+    return $log_rc
+}
+
 _append_log_timestamp() {
     local outfile="$1"
     local msg="${@:2}"  # Capture args 2+ directly
@@ -628,7 +661,10 @@ _append_log_timestamp() {
         local border_str=${(l:86::━:):""}
         printf "\n\n%s\n" "$border_str" >> "$outfile"
     fi
-    print "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" >> "$outfile"
+    local log_msg=""
+    strip_control_chars "$msg" log_msg
+    # Keep literal backslashes in command arguments from becoming escape bytes.
+    print -r -- "[$(date '+%Y-%m-%d %H:%M:%S')] $log_msg" >> "$outfile"
     return 0
 }
 
@@ -1263,7 +1299,8 @@ pv_exec() {
         if [[ -n "$outfile" ]]; then
             # Scrolling popview not enabled (or window to narrow); only capture output to file.
             _append_log_timestamp "$outfile" "$@"
-            command -- "$@" 1>> "$outfile" 2>&1
+            setopt localoptions pipefail
+            command -- "$@" 2>&1 | _pv_filter_log >> "$outfile"
         else
             # No output file specified; output is not captured and only process error code is checked.
             command -- "$@" &>/dev/null
@@ -1321,15 +1358,15 @@ pv_exec() {
         case $pty_kind in
         0) coproc {     # `script` not found, interactive cmds won't work well
             setopt pipefail
-            command -- "$@" 2>&1 | tee -a "$outfile"
+            command -- "$@" 2>&1 | _pv_tee_log "$outfile"
            } ;;
         1) coproc {     # linux version of `script`
             setopt pipefail
-            script -qef -c "$cmd_quoted" /dev/null 2>&1 | tee -a "$outfile"
+            script -qef -c "$cmd_quoted" /dev/null 2>&1 | _pv_tee_log "$outfile"
            } ;;
         2) coproc {     # BSD/macOS version of `script`
             setopt pipefail
-            script -q /dev/null /bin/sh -c "exec \"\$@\"" sh "$@" 2>&1 | tee -a "$outfile"
+            script -q /dev/null /bin/sh -c "exec \"\$@\"" sh "$@" 2>&1 | _pv_tee_log "$outfile"
            } ;;
         esac
     else
