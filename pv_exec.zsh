@@ -98,6 +98,24 @@ pv_get_cursor_row() {
     return 1
 }
 
+# Detect an available PTY-allocation tool so we can access input from interactive
+# commands that read/write via /dev/tty inside the popview.
+#   returns: 0 none, 1 script(linux version), 2 script(BSD/macOS version)
+pv_get_pty_kind() {
+    local out_pty_kind=$1       # after zsh 5.10+ use: local -n out_pty_kind=$1
+
+    if program_exists script; then
+        if script --version 2>/dev/null | grep -qi 'util-linux'; then
+            : ${(P)out_pty_kind::="1"}  # use linux `script` arg syntax
+        else
+            : ${(P)out_pty_kind::="2"}  # else BSD/macOS `script` arg syntax
+        fi
+    else
+        : ${(P)out_pty_kind::="0"}      # `script` not found
+    fi
+    return 0
+}
+
 ########################################
 # Similar to sleep(), but doesn't start a new process.
 pv_sleep() {
@@ -114,6 +132,58 @@ program_exists() {
 }
 
 ########################################
+_pv_record_signal() {
+    PV_SIGNAL=$1
+    return 0
+}
+
+_pv_save_and_config_tty() {
+    if [[ -t 0 ]]; then
+        PV_SAVED_TTY=$(stty -g 2>/dev/null)
+        if [[ -n "$PV_SAVED_TTY" ]]; then
+            stty -echo -icanon min 1 time 0 2>/dev/null
+        fi
+    fi
+    return 0
+}
+
+_pv_restore_tty() {
+    if [[ -n "$PV_SAVED_TTY" ]]; then
+        stty "$PV_SAVED_TTY" 2>/dev/null
+        PV_SAVED_TTY=""
+    fi
+    return 0
+}
+
+_pv_exit_cleanup() {
+    if [[ -n "$PV_PID" ]]; then
+        kill -TERM "$PV_PID" 2>/dev/null
+    fi
+    ((PV_INSIDE_TPUTCSR)) && pv_tput_rcsr
+    pv_tput_cnorm
+    _pv_restore_tty
+    print
+}
+
+########################################
+# Width of a single character in terminal columns (1 or 2). Handles common cases but not all.
+char_width() {
+    local ch=$1
+    local out_width=$2      # after zsh 5.10+ use: local -n out_width=$2
+    local -i codepoint=$((#ch))
+    local -i width=1
+    if   (( codepoint >= 0x1F000 && codepoint <= 0x1F9FF )); then width=2  # Emoji
+    elif (( codepoint >= 0x2600  && codepoint <= 0x27BF  )); then width=2  # Misc Symbols/Dingbats
+    elif (( codepoint >= 0x4E00  && codepoint <= 0x9FFF  )); then width=2  # CJK Unified
+    elif (( codepoint >= 0x3000  && codepoint <= 0x303F  )); then width=2  # CJK Symbols/Punct
+    elif (( codepoint >= 0xAC00  && codepoint <= 0xD7AF  )); then width=2  # Hangul Syllables
+    elif (( codepoint >= 0xFF01  && codepoint <= 0xFF60  )); then width=2  # Fullwidth Forms
+    fi
+    # after zsh 5.10+ use: out_width="$width"
+    : ${(P)out_width::="$width"}
+    return 0
+}
+
 # Remove escape sequences (used to set color, style, cursor pos, etc.) using zsh parameter expansion.
 strip_control_chars() {
     setopt localoptions extendedglob
@@ -130,6 +200,7 @@ strip_control_chars() {
     cleaned=${cleaned//$'\x9B'[0-9;]#[a-zA-Z]/}        # 8-bit CSI sequences
     cleaned=${cleaned//[$'\x80'-$'\x8F'$'\x91'-$'\x98'$'\x9A'$'\x9E'-$'\x9F']/} # Single-byte C1
     cleaned=${cleaned//$'\007'/}                       # Bell character (BEL)
+    cleaned=${cleaned//$'\b'/}                         # Unsupported cursor-left control (BS)
 
     # Note using parameter expansion (above) is orders of magnitude faster than using sed
     # or anything that spawns a new process.
@@ -146,28 +217,13 @@ stripped_len() {
     local outlen=$3     # after zsh 5.10+ use: local -n outlen=$3
     local -i width=0
     if [[ $handle_widechars == "true" ]]; then
-        # Optimization: only try to handle widechars if caller requests it.
+        # Optimization: only handle widechars if caller requests it.
         local -i i=1
         local -i len=${#stripped}
         while (( i <= len )); do
-            # Basic heuristic for common wide characters
-            local char="${stripped[i]}"
-            local codepoint=$((#char))
-            if (( codepoint >= 0x1F000 && codepoint <= 0x1F9FF )); then
-                ((width += 2))  # Emojis
-            elif (( codepoint >= 0x2600 && codepoint <= 0x27BF )); then
-                ((width += 2))  # Miscellaneous Symbols and Dingbats (includes ✅ at U+2705)
-            elif (( codepoint >= 0x4E00 && codepoint <= 0x9FFF )); then
-                ((width += 2))  # CJK Unified Ideographs
-            elif (( codepoint >= 0x3000 && codepoint <= 0x303F )); then
-                ((width += 2))  # CJK Symbols and Punctuation
-            elif (( codepoint >= 0xAC00 && codepoint <= 0xD7AF )); then
-                ((width += 2))  # Hangul Syllables
-            elif (( codepoint >= 0xFF01 && codepoint <= 0xFF60 )); then
-                ((width += 2))  # Fullwidth Forms
-            else
-                ((width += 1))  # Normal width
-            fi
+            local -i cw=0
+            char_width "${stripped[i]}" cw
+            ((width += cw))
             ((i++))
         done
     else
@@ -186,18 +242,89 @@ text_trunc() {
 
     # Strip colors to get just the visible text (otherwise padding calculation are off)
     local -i text_len=0;  stripped_len $handle_widechars "$text_str" text_len
-    local -i chop=$((width - text_len))
-    if (( chop < 0 )); then
+    if (( text_len > width )); then
+        local -i keep_width=$width
+        local suffix=""
         if (( width > 3 )); then
-            text_str="${text_str:0:$((chop-3))}..."
-        elif (( text_len > -chop )); then
-            text_str="${text_str:0:$chop}"
-        else
-            text_str=""
+            keep_width=$((width - 3))
+            suffix="..."
         fi
+
+        # Build the prefix by visible column width so wide characters are not split
+        # and so truncation does not rely on negative zsh substring lengths.
+        local stripped="" prefix=""
+        strip_control_chars "$text_str" stripped
+        local -i used_width=0 pos=1 stripped_chars=${#stripped} char_cols=0
+        while (( pos <= stripped_chars )); do
+            char_width "${stripped[pos]}" char_cols
+            (( used_width + char_cols > keep_width )) && break
+            prefix+="${stripped[pos]}"
+            ((used_width += char_cols))
+            ((pos++))
+        done
+        text_str="$prefix$suffix"
     fi
     # after zsh 5.10+ use: out_text="$text_str"
     : ${(P)out_text::="$text_str"}
+    return 0
+}
+
+# Wrap a single logical line into an array of lines based on `width`. Wide characters
+# (emoji/CJK) count as 2 cols and are never split across a boundary.
+text_wrap() {
+    local -i width=$1
+    local handle_widechars=$2
+    local text_str=$3
+    local out_arr=$4    # after zsh 5.10+ use: local -n out_arr=$4
+
+    # Strip escapes so measurement reflects visible columns only.
+    local stripped=""
+    strip_control_chars "$text_str" stripped
+
+    local -a pieces=()
+    if (( width < 1 )); then
+        pieces=( "$stripped" )
+        set -A "$out_arr" "${pieces[@]}"
+        return 0
+    fi
+
+    if [[ $handle_widechars != "true" ]]; then
+        # Fast path: every char is 1 column, so slice by character count.
+        local -i len=${#stripped} pos=1
+        if (( len == 0 )); then
+            pieces=( "" )
+        else
+            while (( pos <= len )); do
+                pieces+=( "${stripped[pos,pos+width-1]}" )
+                (( pos += width ))
+            done
+        fi
+        set -A "$out_arr" "${pieces[@]}"
+        return 0
+    fi
+
+    # Wide-char-aware path: accumulate visible columns, breaking before a char
+    # would overflow `width`.
+    local -i len=${#stripped} i=1
+    local cur=""
+    local -i cur_cols=0 cw=0
+    if (( len == 0 )); then
+        pieces=( "" )
+    else
+        while (( i <= len )); do
+            local ch="${stripped[i]}"
+            char_width "$ch" cw
+            if (( cur_cols + cw > width )) && [[ -n "$cur" ]]; then
+                pieces+=( "$cur" )
+                cur=""; cur_cols=0
+            fi
+            cur+="$ch"
+            ((cur_cols += cw))
+            ((i++))
+        done
+        [[ -n "$cur" ]] && pieces+=( "$cur" )
+    fi
+    set -A "$out_arr" "${pieces[@]}"
     return 0
 }
 
@@ -215,9 +342,34 @@ url_encode_file() {
         if [[ "$ch" == [a-zA-Z0-9._~/-] ]]; then
             encoded_url+="$ch"
         else
+            local -i codepoint=$((#ch))
+            local -i byte1=0 byte2=0 byte3=0 byte4=0
             local hex=""
-            print -v hex -f "%02X" "'$ch"
-            encoded_url+="%$hex"
+            if (( codepoint < 0x80 )); then
+                print -v hex -f "%02X" "$codepoint"
+                encoded_url+="%$hex"
+            elif (( codepoint < 0x800 )); then
+                byte1=$((0xC0 | (codepoint >> 6)))
+                byte2=$((0x80 | (codepoint & 0x3F)))
+                print -v hex -f "%02X" "$byte1"; encoded_url+="%$hex"
+                print -v hex -f "%02X" "$byte2"; encoded_url+="%$hex"
+            elif (( codepoint < 0x10000 )); then
+                byte1=$((0xE0 | (codepoint >> 12)))
+                byte2=$((0x80 | ((codepoint >> 6) & 0x3F)))
+                byte3=$((0x80 | (codepoint & 0x3F)))
+                print -v hex -f "%02X" "$byte1"; encoded_url+="%$hex"
+                print -v hex -f "%02X" "$byte2"; encoded_url+="%$hex"
+                print -v hex -f "%02X" "$byte3"; encoded_url+="%$hex"
+            else
+                byte1=$((0xF0 | (codepoint >> 18)))
+                byte2=$((0x80 | ((codepoint >> 12) & 0x3F)))
+                byte3=$((0x80 | ((codepoint >> 6) & 0x3F)))
+                byte4=$((0x80 | (codepoint & 0x3F)))
+                print -v hex -f "%02X" "$byte1"; encoded_url+="%$hex"
+                print -v hex -f "%02X" "$byte2"; encoded_url+="%$hex"
+                print -v hex -f "%02X" "$byte3"; encoded_url+="%$hex"
+                print -v hex -f "%02X" "$byte4"; encoded_url+="%$hex"
+            fi
         fi
     done
     # after zsh 5.10+ use: out_url="encoded_url"
@@ -270,9 +422,8 @@ url_extract_ui_label() {
     return 0
 }
 
-# This escape encodes the URL arg (file://, http://, etc.) into a sequence that most
-# terminal apps (not macOS Terminal, unfortunately) recognize and allow for hot clicking
-# (normally via CMD+click).
+# This escape encodes the URL arg (file://, http://, etc.) into an OSC 8 hyperlink
+# sequence. Terminals that do not support OSC 8 use the plain-text fallback below.
 url_term_render() {
     setopt localoptions extendedglob
     local in_url=$1
@@ -287,10 +438,11 @@ url_term_render() {
         local url_glyph="🧾"
     fi
 
-    # Try escaped hyperlink encoding in supported terminals. Could probably remove this conditional
-    # and just always do the encoding.
+    # These terminal identifiers are commonly used by OSC 8-capable terminals.
+    # Multiplexers are intentionally omitted because OSC 8 passthrough depends on
+    # their version and configuration.
     local -i render_blue=0
-    if [[ -n "${TERM_PROGRAM:-}" && "${TERM_PROGRAM:l}" == (iterm.app|apple_terminal) ]]; then
+    if [[ "${TERM_PROGRAM:l}" == (iterm.app|apple_terminal|wezterm|kitty|ghostty|vscode|alacritty|hyper|windows_terminal|konsole|gnome|foot|contour|mintty|rio|warp|warpterminal|tabby|tilix) ]]; then
         if ((render_blue)); then
             print -v url_text -f "${MSG_INFO_TEXT_COLOR}%s \033]8;;%s\007%s\033]8;;\007${PV_RESET}" "$url_glyph" "$in_url" "$label"
         else
@@ -382,23 +534,23 @@ else
 fi
 
 ########################################
-_yield_to_parser() {
-    # Before calling pv_get_term_width/height, we must force zsh to hit its parser
-    # boundary processing which will update $COLUMNS and $LINES (which our pv_get_term_*
+_yield_for_term_resizing() {
+    # Before calling pv_get_term_width/height, we must force zsh to hit its execution
+    # boundary which will update $COLUMNS and $LINES (which our pv_get_term_*
     # funcs use). If we don't do this then we never detect window resizing. I tried
     # using local trap on WINCH and the global TRAPWINCH() function, but those will not
-    # work either without the parser boundary processing. The local trap on WINCH is only
-    # processed when parser boundary is hit. The global TRAPWINCH() function is called
+    # work either without the execution boundary processing. The local trap on WINCH is only
+    # processed when execution boundary is hit. The global TRAPWINCH() function is called
     # immediately (via signal) BUT any variables it updates (like RESIZE_NEEDED=1) will
-    # not be reflected in our loop here until the parser boundary. The only solution
+    # not be reflected in our loop here until the execution boundary. The only solution
     # would be to write to a temp FD inside TRAPWINCH() that we then add to our zselect,
-    # but even with that we would then (here) still need to force the parser boundary
+    # but even with that we would then (here) still need to force the execution boundary
     # (using /usr/bin/true, sleep 0.01, etc.) to have $COLUMNS and $LINES updates, so
     # the only gain is that we would process the resize more quickly. Given our zselect
     # delay here is very short (PV_SPINNER_UPDATE_INTERVAL), we will handle the resize
     # quickly enough without all that extra overhead/code.
     /usr/bin/true
-    # Here are a couple of alternative techniques for forcing parser boundary that
+    # Here are a couple of alternative techniques for forcing execution boundary that
     # are slower. I tried to find a way to trip it without having to call/spawn a
     # new process but couldn't find any that worked.
     #   : | :
@@ -482,6 +634,7 @@ _append_log_timestamp() {
 
 _start_popview() {
     local label=$1
+    local pending_frag="$PV_PENDING_FRAG"
     pv_get_term_width PV_WIN_ORIG_WIDTH; pv_get_term_height PV_WIN_ORIG_HEIGHT
 
     print                               # Placeholder for label (will be filled in below)
@@ -513,6 +666,12 @@ _start_popview() {
     PV_BOT_SCROLLREGION=$((PV_TOP_SCROLLREGION + PV_MAX_HEIGHT - 1))
     pv_tput_cup "$PV_TOP_SCROLLREGION" 0   # move cursor to top-left of scroll region
     PV_CUR_HEIGHT=0
+    PV_SCROLL_ON_NEXT_LN=0
+    PV_ROW_PAINTED=0
+    if [[ -n "$pending_frag" ]]; then
+        local -i pending_width=$((PV_WIN_ORIG_WIDTH - PV_BORDER_MARGIN_LEFT - PV_BORDER_MARGIN_RIGHT - 4))
+        _paint_row "$pending_frag" "$pending_width"
+    fi
     return 0
 }
 
@@ -520,13 +679,15 @@ _end_popview_leave_open() {
     local label=$1
     local outfile=$2
     local rc=$3
+    local -i display_height=$PV_CUR_HEIGHT
+    (( PV_CUR_HEIGHT < PV_MAX_HEIGHT && PV_ROW_PAINTED )) && ((display_height++))
 
     pv_tput_cup $PV_TOP_ANCHOR 0
     if (( rc == 0 )); then
         _render_label_success "$label" "$outfile"
     else
         _render_label_failure "$label" "$outfile" "$rc"
-        if ((PV_BORDER_SHOW && PV_CUR_HEIGHT > 0)); then
+        if ((PV_BORDER_SHOW && display_height > 0)); then
             # Re-render the border in red (leaving text inside view untouched).
             pv_get_term_width PV_WIN_ORIG_WIDTH; pv_get_term_height PV_WIN_ORIG_HEIGHT
 
@@ -538,7 +699,7 @@ _end_popview_leave_open() {
 
             print "$PV_TOP_BORDER_STR"
             local -i index=0    ypos=$PV_TOP_SCROLLREGION
-            for (( index = 0; index < PV_CUR_HEIGHT; index++, ypos++ )); do
+            for (( index = 0; index < display_height; index++, ypos++ )); do
                 pv_tput_cup "$ypos" 0;                  printf "%s${MSG_FAILURE_TEXT_COLOR}│" "$padleft_str"
                 pv_tput_cup "$ypos" "$rt_border_xpos";  print "│${PV_RESET}"
             done
@@ -546,8 +707,8 @@ _end_popview_leave_open() {
             return 0
         fi
     fi
-    if ((PV_CUR_HEIGHT > 0)); then
-        local -i ypos=$((PV_TOP_SCROLLREGION + PV_CUR_HEIGHT - 1))
+    if ((display_height > 0)); then
+        local -i ypos=$((PV_TOP_SCROLLREGION + display_height - 1))
         ((PV_BORDER_SHOW)) && ((ypos++))
         pv_tput_cup "$ypos" 0
         print
@@ -573,11 +734,17 @@ _end_popview_with_close() {
     fi
 
     if ((PV_BORDER_SHOW && PV_BORDER_ANIMATE_CLOSE)); then
-        PV_BOT_SCROLLREGION=$((PV_TOP_SCROLLREGION + PV_CUR_HEIGHT))
+        # PV_CUR_HEIGHT counts committed rows. Before the frame is full, _paint_row()
+        # also leaves an uncommitted current row on screen after output ending in LF;
+        # include that row so the bottom border remains inside the closing scroll
+        # region. Once full, the current row is already the last row of the region.
+        local -i close_height=$PV_CUR_HEIGHT
+        (( PV_CUR_HEIGHT < PV_MAX_HEIGHT && PV_ROW_PAINTED )) && ((close_height++))
+        PV_BOT_SCROLLREGION=$((PV_TOP_SCROLLREGION + close_height))
         pv_tput_csr "$PV_TOP_SCROLLREGION" "$PV_BOT_SCROLLREGION"; PV_INSIDE_TPUTCSR=1
-        pv_tput_cup "$((PV_TOP_SCROLLREGION + PV_CUR_HEIGHT))" 0
+        pv_tput_cup "$((PV_TOP_SCROLLREGION + close_height))" 0
         local -i index
-        for (( index = 0; index < PV_CUR_HEIGHT; index++ )); do
+        for (( index = 0; index < close_height; index++ )); do
             print
             pv_sleep $PV_CLOSE_FRAME_DELAY
             if _process_win_resize unused_width unused_height; then
@@ -616,108 +783,191 @@ _render_progress_spinner() {
     return 0
 }
 
-_render_line() {
+# Compute the row (0-based terminal row) of the current "bottom" content line.
+# While the frame is still growing this is the PV_CUR_HEIGHT-th row; once the frame
+# is full (scroll region locked) the current row is always the last region row.
+_pv_current_row() {
+    local out_row=$1
+    local -i row
+    if (( PV_CUR_HEIGHT < PV_MAX_HEIGHT )); then
+        row=$(( PV_TOP_SCROLLREGION + PV_CUR_HEIGHT ))
+    else
+        row=$(( PV_TOP_SCROLLREGION + PV_MAX_HEIGHT - 1 ))
+    fi
+    : ${(P)out_row::="$row"}
+    return 0
+}
+
+# Draw text on the CURRENT bottom row, in place. Only advances the scroll region
+# if PV_SCROLL_ON_NEXT_LN==1 (meaning _commit_row() was called). Otherwise, it
+# doesn't scroll and will paint over the existing current line. Used identically
+# for: a still-growing prompt fragment, the user's typed input echo, and a
+# finalized (newline-terminated) line. Caller is responsible for calling
+# _commit_row() when there is a line ending to advance/scroll to a new line.
+_paint_row() {
     local text=$1
     local width=$2
 
-    pv_tput_rmam  # disable auto-wrapping of lines
+    local noesc_text=""
+    strip_control_chars "$text" noesc_text
+    ((${#noesc_text} > width)) && noesc_text="${noesc_text[1,$width]}"
+
+    pv_tput_rmam   # disable auto-wrapping of lines
     pv_start_buffered_update
 
+    # Ensure the top border exists before the very first row is drawn.
+    if ((PV_BORDER_SHOW && PV_CUR_HEIGHT == 0)); then
+        pv_tput_cup "$((PV_TOP_SCROLLREGION - 1))" 0
+        print "$PV_TOP_BORDER_STR"
+    # If a previous full-height commit owes a scroll, do it now (via `print`) to
+    # open a fresh bottom row (to be rendered to below).
+    elif (( PV_SCROLL_ON_NEXT_LN )); then
+        PV_SCROLL_ON_NEXT_LN=0
+        pv_tput_cup "$((PV_TOP_SCROLLREGION + PV_MAX_HEIGHT - 1))" 0
+        print
+    fi
+
+    local -i ypos=0; _pv_current_row ypos
+    local padleft_str=${(l:$PV_BORDER_MARGIN_LEFT:: :):""}
+
     if ((PV_BORDER_SHOW)); then
-        # This case is more complicated because we animate/grow the border frame downward
-        # as the first PV_MAX_HEIGHT lines arrive, and only set the scroll region once
-        # that height is hit.
-        if ((PV_CUR_HEIGHT == 0)); then
-            # First output line: draw top border.
-            local -i ypos=$((PV_TOP_SCROLLREGION - 1))
-            pv_tput_cup "$ypos" 0
-            print "$PV_TOP_BORDER_STR"
-        else
-            # Advance to next line (previous output line doesn't include /n).
-            # This will force a line scroll if PV_CUR_HEIGHT == PV_MAX_HEIGHT.
-            local -i ypos=$((PV_TOP_SCROLLREGION + PV_CUR_HEIGHT - 1))
-            pv_tput_cup "$ypos" 0
-            print
-        fi
-        # Render the output line (which was wrapped for us using 'fold').
-        local padleft_str=${(l:$PV_BORDER_MARGIN_LEFT:: :):""}
-        if ((1)); then
-            # Handling double-width characters is problematic since neither the built-in
-            # string length primitives (printf with %-*s) nor the 'fold' command handle
-            # them correctly. This results in the line truncation (or wrapping if using fold)
-            # breaking at the wrong place, which also results in our right border line
-            # rendering at the incorrect location (offset to the right or offscreen).
-            #
-            # The best we can do here is turn off auto-wrappping of lines and truncate
-            # the line using printf %-*s primitive which might bleed over to the right
-            # too many characters. Next we force the cursor to the correct location to
-            # draw the right border char, then clear to end-of-line. This results in
-            # at least the right border drawing at the correct location. Some characters
-            # in the line might be truncated in this case (even if PV_WRAP_LINES is 1),
-            # but is a pretty small rendering buglet probably not noticed.
-            printf "%s${PROCESSING_TEXT_COLOR}│ ${LOG_TEXT_COLOR}%-*s " "$padleft_str" "$width" "$text"
-            local -i ypos=$((PV_TOP_SCROLLREGION + PV_CUR_HEIGHT))
-            ((PV_CUR_HEIGHT == PV_MAX_HEIGHT)) && ((ypos--))
-            pv_tput_cup "$ypos" "$((PV_WIN_ORIG_WIDTH - PV_BORDER_MARGIN_RIGHT - 1))"
-            print -n "${PROCESSING_TEXT_COLOR}│${PV_RESET}";    pv_tput_el
-        else
-            # This simpler (and unused) technique works okay if there are no double-width
-            # characters. If there are then the right border will be at the wrong location
-            # and PV_BORDER_MARGIN_RIGHT won't be obeyed.
-            printf "%s${PROCESSING_TEXT_COLOR}│ ${LOG_TEXT_COLOR}%-*s ${PROCESSING_TEXT_COLOR}│${PV_RESET}" "$padleft_str" "$width" "$text"
-            pv_tput_el
-        fi
+        # Double-width safe right border trick (preserved): print left border + text
+        # with %-*s (may overshoot on wide chars), then force the cursor to the exact
+        # right-border column, draw it, and clear to end-of-line.
+        pv_tput_cup "$ypos" 0
+        printf "%s${PROCESSING_TEXT_COLOR}│ ${LOG_TEXT_COLOR}%-*s " "$padleft_str" "$width" "$noesc_text"
+        pv_tput_cup "$ypos" "$((PV_WIN_ORIG_WIDTH - PV_BORDER_MARGIN_RIGHT - 1))"
+        print -n "${PROCESSING_TEXT_COLOR}│${PV_RESET}";    pv_tput_el
+        # While growing, keep the bottom border painted one row below the current row.
         if ((PV_CUR_HEIGHT < PV_MAX_HEIGHT)); then
-            # Re-render bottom border one line down (it was just erased by the
-            # output line above). This creates the dynamic growing border view
-            # animation.
-            print -n "\n$PV_BOT_BORDER_STR";    pv_tput_el
-            ((PV_CUR_HEIGHT++))
-            if ((PV_CUR_HEIGHT == PV_MAX_HEIGHT)); then
-                # The last output line above was on the last line of the scroll
-                # region, so it is time to set the scroll region so all subsequent
-                # output lines automatically scroll correctly. After this point
-                # we no longer need to render the bottom border, as the scroll
-                # region is now full and locked in (the bottom border is no longer
-                # overwritten by the output since it is outside the scroll region).
-                pv_tput_csr "$PV_TOP_SCROLLREGION" "$PV_BOT_SCROLLREGION"; PV_INSIDE_TPUTCSR=1
-            fi
-            pv_tput_cup "$((PV_TOP_SCROLLREGION + PV_CUR_HEIGHT - 1))" 0
+            pv_tput_cup "$((ypos + 1))" 0
+            print -n "$PV_BOT_BORDER_STR";    pv_tput_el
         fi
     else
-        # This case (no border) is much simpler since we can set the scroll region
-        # on the very first output line, and then let it handle the scrolling from
-        # that point forward.
-        if ((PV_CUR_HEIGHT == 0)); then
-            # First output line: set scroll region and move cursor to top
-            local -i ypos=$PV_TOP_SCROLLREGION
-            pv_tput_csr "$ypos" "$PV_BOT_SCROLLREGION"; PV_INSIDE_TPUTCSR=1
-            pv_tput_cup "$ypos" 0
-        else
-            # Advance to next line (previous output line doesn't include /n).
-            # This will force a line scroll if PV_CUR_HEIGHT == PV_MAX_HEIGHT.
-            local -i ypos=$((PV_TOP_SCROLLREGION + PV_CUR_HEIGHT - 1))
-            pv_tput_cup "$ypos" 0
-            print
-        fi
-        if ((PV_CUR_HEIGHT < PV_MAX_HEIGHT)); then
-            ((PV_CUR_HEIGHT++))
-        fi
-        local padleft_str=${(l:$PV_BORDER_MARGIN_LEFT:: :):""}
-        printf "%s  ${LOG_TEXT_COLOR}%-*s${PV_RESET}  " "$padleft_str" "$width" "$text";    pv_tput_el
+        pv_tput_cup "$ypos" 0
+        printf "%s  ${LOG_TEXT_COLOR}%-*s${PV_RESET}  " "$padleft_str" "$width" "$noesc_text";    pv_tput_el
     fi
 
     pv_end_buffered_update
-    pv_tput_smam  # re-enable auto-wrapping of lines
+    pv_tput_smam   # re-enable auto-wrapping of lines
+    PV_ROW_PAINTED=1
+    return 0
+}
+
+# Flag (via PV_SCROLL_ON_NEXT_LN) that the current row is complete and the next row
+# (when _paint_row() is called) should advance/scroll to the next line. When the
+# maximum height of the scroll view is reached the scroll region is locked in so
+# that the vertical line scrolling region is correct.
+_commit_row() {
+    PV_ROW_PAINTED=0
+    if (( PV_CUR_HEIGHT < PV_MAX_HEIGHT )); then
+        ((PV_CUR_HEIGHT++))
+        if (( PV_CUR_HEIGHT == PV_MAX_HEIGHT )); then
+            # Frame just filled: lock the scroll region so subsequent _paint_row() scrolls.
+            pv_tput_csr "$PV_TOP_SCROLLREGION" "$PV_BOT_SCROLLREGION"; PV_INSIDE_TPUTCSR=1
+            PV_SCROLL_ON_NEXT_LN=1
+        fi
+    else
+        # Frame is full: lock the scroll region so subsequent _paint_row() scrolls.
+        PV_SCROLL_ON_NEXT_LN=1
+    fi
+    return 0
+}
+
+_relay_keyboard_stdin() {
+    local -i width=$1
+
+    # Pull all immediately-available keyboard input (we already know fd 0 is readable).
+    local keys="" ch=""
+    IFS= read -r -k 1 -u 0 ch && keys+="$ch"
+    while IFS= read -r -t 0 -k 1 -u 0 ch; do
+        keys+="$ch"
+    done
+    [[ -z "$keys" ]] && return 0
+
+    # Forward the raw bytes to the running command's stdin (PV_FD_IN).
+    #
+    # If there is a PTY active (PV_PTY_ACTIVE), then a terminal echo will occur
+    # (along with line editing handling) and the keys pressed will be relayed to
+    # PV_FD_OUT and handled inside _process_popview().
+    print -rn -- "$keys" >&$PV_FD_IN
+
+    # If there not a PTY active, then the input was relayed to the command via
+    # the `print` call above (same as PTY active case) but it will not be echoed
+    # or relayed to PV_FD_OUT.
+    if (( ! PV_PTY_ACTIVE )); then
+        # A plain pipe (no PTY) will have no terminal echo or line editing handling.
+        # Just display each byte as it was forwarded instead of pretending that line
+        # edit are actually beind performed. LF/CR commits the displayed row; other
+        # controls show caret notation because rendering them literally would make
+        # the display terminal perform the formatting.
+        local kc=""
+        local -i k=0 kc_code=0 caret_code=0 previous_was_cr=0
+        for (( k = 1; k <= ${#keys}; k++ )); do
+            kc="${keys[k]}"
+            kc_code=$((#kc))
+            if (( kc_code == 10 || kc_code == 13 )); then
+                # Treat CRLF as one Return if both bytes arrive in the same batch.
+                if (( kc_code == 10 && previous_was_cr )); then
+                    previous_was_cr=0
+                    continue
+                fi
+                _paint_row "$PV_PENDING_FRAG" "$width"
+                _commit_row
+                PV_PENDING_FRAG=""
+                previous_was_cr=$((kc_code == 13))
+            elif (( kc_code == 127 )); then
+                previous_was_cr=0
+                PV_PENDING_FRAG+="^?"
+            elif (( kc_code < 32 )); then
+                previous_was_cr=0
+                caret_code=$((kc_code + 64))
+                PV_PENDING_FRAG+="^${(#)caret_code}"
+            else
+                previous_was_cr=0
+                PV_PENDING_FRAG+="$kc"
+            fi
+        done
+        _paint_row "$PV_PENDING_FRAG" "$width"
+    fi
+
+    if [[ "$keys" == *$'\r'* || "$keys" == *$'\n'* ]]; then
+        # <LF> or <CR> indicates that the input might be complete. Reset prompt state to
+        # command busy (0) to hide the cursor until the command emits another candidate.
+        PV_INPUT_ACTIVE=0
+        PV_PROMPT_STATE=0
+        PV_PROMPT_CANDIDATE_SINCE=0
+    else
+        # Once the user types, keep the cursor visible until submission. This is just
+        # a heuristic and won't be 100% accurate.
+        PV_INPUT_ACTIVE=1
+        PV_PROMPT_STATE=2
+    fi
+    return 0
+}
+
+# Place the cursor at the end of the current prompt fragment and reveal it.
+# Best-effort (positions within the box).
+_show_prompt_cursor() {
+    local -i width=$1
+    local -i ypos=0; _pv_current_row ypos
+
+    # Visible columns used by the prompt text (escape/wide-char aware), clamped to box.
+    local -i cols=0
+    stripped_len "true" "$PV_PENDING_FRAG" cols
+    (( cols > width )) && cols=width
+
+    local -i xpos=$(( PV_BORDER_MARGIN_LEFT + 2 + cols ))
+    pv_tput_cup "$ypos" "$xpos"
+    pv_tput_cnorm
     return 0
 }
 
 _process_win_resize() {
-    local out_width=$1    # after zsh 5.10+ use: local -n out_width=$1
-    local out_height=$2   # after zsh 5.10+ use: local -n out_height=$2
+    local out_width=$1 out_height=$2    # after zsh 5.10+ use: local -n out_width=$1 out_height=$2
 
     # must call yield before pv_get_term_width / pv_get_term_height
-    _yield_to_parser
+    _yield_for_term_resizing
     local -i width=0 height=0
     pv_get_term_width width; pv_get_term_height height
     # after zsh 5.10+ use: out_width="$width" and out_height="$height"
@@ -738,14 +988,27 @@ _process_win_resize() {
 
 _process_popview() {
     local label=$1
-    if [[ -z $PV_PID || -z $PV_FD ]]; then
+    local -i allow_interactive=${2:-$PV_ALLOW_INTERACTIVE}
+    if [[ -z $PV_PID || -z $PV_FD_OUT ]]; then
         return 0   # No pending async process, bail out.
     fi
 
     local -i select_timeout=$((100 * PV_SPINNER_UPDATE_INTERVAL))
     while true; do
-        local -i fd_readable=0
-        zselect -t $select_timeout -r $PV_FD && fd_readable=1
+        (( PV_SIGNAL )) && break
+        local -i coprocess_stdout_readable=0
+        local -i keyboard_stdin_readable=0
+        if ((allow_interactive)); then
+            # Watch for both the coproc output AND our stdin so we can relay keystrokes.
+            local -a ready_fds=()
+            if zselect -a ready_fds -t $select_timeout -r $PV_FD_OUT -r 0; then
+                (( ${ready_fds[(Ie)$PV_FD_OUT]} )) && coprocess_stdout_readable=1
+                (( ${ready_fds[(Ie)0]} ))          && keyboard_stdin_readable=1
+            fi
+        else
+            zselect -t $select_timeout -r $PV_FD_OUT && coprocess_stdout_readable=1
+        fi
+
         local -i cur_width=0 unused_height=0
         if _process_win_resize cur_width unused_height; then
             if ((PV_WIN_TOO_SMALL)); then
@@ -760,33 +1023,127 @@ _process_popview() {
                 _start_popview $label
             fi
         fi
-        if (( fd_readable )); then
-            local lineout=""
-            if ! read -r -u $PV_FD lineout; then
+        (( PV_SIGNAL )) && break
+        local -i width=$((cur_width - PV_BORDER_MARGIN_LEFT - PV_BORDER_MARGIN_RIGHT - 4))
+
+        if (( keyboard_stdin_readable )) && [[ -n "$PV_FD_IN" ]]; then
+            # Relay any pending keystrokes into the running command's stdin.
+            _relay_keyboard_stdin "$width"
+        fi
+        (( PV_SIGNAL )) && break
+
+        if (( coprocess_stdout_readable )); then
+            # Drain everything currently available from the coprocess output without
+            # blocking on a trailing newline. Complete lines render normally; a trailing
+            # fragment (a prompt with no newline) is stashed and rendered on the next
+            # idle tick.
+            local first_char=""
+            if ! IFS= read -r -k 1 -u $PV_FD_OUT first_char; then
+                # EOF: finalize any trailing partial as a committed line, then bail out.
+                if [[ -n "$PV_PENDING_FRAG" ]]; then
+                    _paint_row "$PV_PENDING_FRAG" "$width"
+                    _commit_row
+                    PV_PENDING_FRAG=""
+                fi
+                PV_INPUT_ACTIVE=0
+                PV_PROMPT_STATE=0
+                PV_PROMPT_CANDIDATE_SINCE=0
                 break
             fi
-            # Saving entire scrollview buffer (PV_OUTBUF) is currently disabled since
-            # we don't reference it anywhere (and provide an optional $outfile argument
-            # to save all output to a file). If we ever need it, then uncomment:
-            #   PV_OUTBUF+="$lineout"$'\n'
+            PV_PENDING_FRAG+="$first_char"
 
-            local -i width=$((cur_width - PV_BORDER_MARGIN_LEFT - PV_BORDER_MARGIN_RIGHT - 4))
-            if (( PV_WRAP_LINES )); then
-                while IFS= read -r text; do
-                    local noesc_text=""
-                    strip_control_chars "$text" noesc_text
-                    _render_line "$noesc_text" "$width"
-                done < <(printf '%s\n' "$lineout" | fold -s -w "$width")
-            else
-                # Hard truncate to width instead of wrapping.
-                local noesc_text=""
-                strip_control_chars "$lineout" noesc_text
-                ((${#noesc_text} > width)) && noesc_text="${noesc_text[1,$width]}"
-                _render_line "$noesc_text" "$width"
+            local next_char=""
+            while IFS= read -r -t 0 -k 1 -u $PV_FD_OUT next_char; do
+                PV_PENDING_FRAG+="$next_char"
+            done
+
+            # Narrow PTY-editing support: recognize only the conventional cooked-mode
+            # rub-out echo "\b \b" (likely delete key). Apply it to the combined pending
+            # data so preceding characters from this same chunk are removed correctly
+            # and a sequence split across two reads is recognized. Bare backspaces, ANSI
+            # cursor editing, etc., are deliberately not handled to keep implementation
+            # simple.
+            if (( PV_PTY_ACTIVE )); then
+                local rubout=$'\b \b'
+                while [[ "$PV_PENDING_FRAG" == *${rubout}* ]]; do
+                    local before_rubout="${PV_PENDING_FRAG%%${rubout}*}"
+                    local after_rubout="${PV_PENDING_FRAG#*${rubout}}"
+                    PV_PENDING_FRAG="${before_rubout%?}${after_rubout}"
+                done
             fi
-            _render_progress_spinner
+
+            # Normalize all line endings to LF. Under a PTY the terminator can be
+            # '\r\n' or a bare '\r'; on a plain pipe it is '\n'. Progress-bar style
+            # bare-CR redraws on a plain pipe are handled by treating them as line
+            # ends here too, which is fine for our row-at-a-time model.
+            local nl=$'\n' cr=$'\r'
+            PV_PENDING_FRAG="${PV_PENDING_FRAG//${cr}${nl}/${nl}}"
+            PV_PENDING_FRAG="${PV_PENDING_FRAG//${cr}/${nl}}"
+
+            # Paint and commit each completed (LF-terminated) line. One scroll per LF.
+            local -i completed_line=0
+            while [[ "$PV_PENDING_FRAG" == *${nl}* ]]; do
+                local oneline="${PV_PENDING_FRAG%%${nl}*}"
+                PV_PENDING_FRAG="${PV_PENDING_FRAG#*${nl}}"
+                completed_line=1
+                if (( PV_WRAP_LINES )); then
+                    # Wide-char-aware wrap: split the logical line into rows of at
+                    # most `width` visible columns, painting/committing each piece.
+                    local -a _wrapped=()
+                    text_wrap "$width" "true" "$oneline" _wrapped
+                    local _piece=""
+                    for _piece in "${_wrapped[@]}"; do
+                        _paint_row "$_piece" "$width"
+                        _commit_row
+                    done
+                else
+                    _paint_row "$oneline" "$width"
+                    _commit_row
+                fi
+            done
+
+            # A trailing partial is a prompt candidate, not proof of a prompt. Paint it
+            # in place, but keep the cursor hidden until it remains unchanged for
+            # PV_PROMPT_SETTLE_INTERVAL. Resetting the timestamp on every output chunk
+            # prevents a temporarily split normal line from flashing the input cursor.
+            # User typing (PV_INPUT_ACTIVE == 1) is stronger prompt state evidence and
+            # keeps prompting (input cursor) active (PV_PROMPT_STATE == 2).
+            if [[ -n "$PV_PENDING_FRAG" ]]; then
+                if (( PV_INPUT_ACTIVE )); then
+                    PV_PROMPT_STATE=2
+                else
+                    PV_PROMPT_STATE=1
+                    PV_PROMPT_CANDIDATE_SINCE=$EPOCHREALTIME
+                fi
+                _paint_row "$PV_PENDING_FRAG" "$width"
+            else
+                # A completed output line always opens a fresh visual row and hides
+                # the input cursor. The command script might still be expecting another
+                # line of input, but there is no way we can determine that so the cursor
+                # just remains hidden until the user starts to type. Best we can do.
+                PV_INPUT_ACTIVE=0
+                PV_PROMPT_STATE=0
+                PV_PROMPT_CANDIDATE_SINCE=0
+                (( completed_line )) && _paint_row "" "$width"
+            fi
         else
-            _render_progress_spinner
+            # Idle case: command is either busy or waiting for input. We promote to
+            # showing the input cursor only after a partial frag output and after
+            # PV_PROMPT_SETTLE_INTERVAL time has passed.
+            if (( PV_PROMPT_STATE == 1 )) &&
+               (( EPOCHREALTIME - PV_PROMPT_CANDIDATE_SINCE >= PV_PROMPT_SETTLE_INTERVAL )); then
+                PV_PROMPT_STATE=2
+            fi
+        fi
+
+        # The spinner means only that the child cmd is still running, so it is always
+        # rendered. Prompt detection independently controls cursor visibility. Paint
+        # the spinner first because it moves the terminal cursor to the label row.
+        _render_progress_spinner
+        if (( PV_PROMPT_STATE == 2 )); then
+            _show_prompt_cursor "$width"
+        else
+            pv_tput_civis
         fi
     done
     # reset scroll region to full screen
@@ -795,8 +1152,8 @@ _process_popview() {
 }
 
 _show_usage() {
-    local script_name=$1
-    print -u2 "usage: $script_name [-l label] [-o outfile] cmd [args...]"
+    local cmd_name=$1
+    print -u2 "usage: $cmd_name [-l label] [-o outfile] cmd [args...]"
     return 0
 }
 
@@ -826,7 +1183,19 @@ pv_init() {
     typeset -gi PV_MIN_WIN_HEIGHT=$((PV_MAX_HEIGHT + 8))
     typeset -gi PV_WIN_TOO_SMALL=0
 
-    typeset -g PV_PID=""    PV_FD=""     PV_OUTBUF=""
+    typeset -gi PV_ALLOW_INTERACTIVE=1          # 1 to relay keystrokes into the running command
+    typeset -g PV_PID=""   PV_FD_OUT=""   PV_FD_IN=""
+    typeset -gi PV_SIGNAL=0
+    typeset -g PV_SAVED_TTY=""
+    typeset -g PV_PENDING_FRAG=""               # trailing bytes with no newline yet (likley a prompt)
+    typeset -gi PV_SCROLL_ON_NEXT_LN=0          # 1 when the next _paint_row() should scroll before next line
+    typeset -gi PV_ROW_PAINTED=0                # 1 when the current row is painted but not yet committed
+    typeset -gi PV_PTY_ACTIVE=0                 # 1 when child command runs under a PTY
+    typeset -gi PV_PROMPT_STATE=0               # 0: command busy, 1: possible prompt (non-empty input frag), 2: active prompting
+    typeset -gi PV_INPUT_ACTIVE=0               # user has typed but has not submitted the line
+    typeset -gF PV_PROMPT_CANDIDATE_SINCE=0
+    typeset -gF PV_PROMPT_SETTLE_INTERVAL=0.25  # unchanged non-empty input frag duration required before showing cursor
+
     typeset -g PV_TOP_BORDER_STR=""      PV_BOT_BORDER_STR=""
     typeset -gi PV_WIN_ORIG_WIDTH=0      PV_WIN_ORIG_HEIGHT=0
     typeset -gi PV_TOP_ANCHOR=0
@@ -847,13 +1216,27 @@ pv_init() {
 
 pv_exec() {
     emulate -L zsh
+    setopt localtraps
     pv_init
 
     local label outfile
+    local -i allow_interactive=0
     while (( $# )); do
         case $1 in
-        -l)  label=$2;        shift 2 ;;
-        -o)  outfile=$2;      shift 2 ;;
+        -l)
+            if (( $# < 2 )); then
+                print -u2 "Error: option '-l' requires a label"
+                _show_usage "${0:t}"
+                return 2
+            fi
+            label=$2;         shift 2 ;;
+        -o)
+            if (( $# < 2 )); then
+                print -u2 "Error: option '-o' requires an outfile"
+                _show_usage "${0:t}"
+                return 2
+            fi
+            outfile=$2;       shift 2 ;;
         -l*) label=${1#-l};   shift   ;;
         -o*) outfile=${1#-o}; shift   ;;
         --)                   shift; break ;;
@@ -875,6 +1258,8 @@ pv_exec() {
     pv_get_term_width width; pv_get_term_height height
     if ((PV_ENABLE == 0 || width < PV_MIN_WIN_WIDTH || height < PV_MIN_WIN_HEIGHT)); then
         _render_label_processing "$label"
+        # Note in this case interactive (keyboard) input is not handled. No plans to change
+        # the handling of this edge case given complexity involved.
         if [[ -n "$outfile" ]]; then
             # Scrolling popview not enabled (or window to narrow); only capture output to file.
             _append_log_timestamp "$outfile" "$@"
@@ -902,36 +1287,110 @@ pv_exec() {
         return 2
     fi
 
-    PV_PID=""; PV_FD=""; PV_OUTBUF=""
+    PV_PID=""; PV_FD_OUT=""; PV_FD_IN=""
+    PV_PENDING_FRAG=""
+    PV_PROMPT_STATE=0
+    PV_INPUT_ACTIVE=0
+    PV_PROMPT_CANDIDATE_SINCE=0
+    PV_SIGNAL=0
+    PV_SAVED_TTY=""
+
+    # Interactive keyboard handling requires terminal (not pipe) input.
+    allow_interactive=$PV_ALLOW_INTERACTIVE
+    if (( allow_interactive )) && [[ ! -t 0 ]]; then
+        allow_interactive=0
+    fi
+
+    # Decide whether to run the child under a PTY. A PTY is what makes /dev/tty-based
+    # prompts (and color/interactive behavior) work inside the popview. We only use it
+    # when interactive input is allowed and a PTY tool exists; otherwise fall back to the plain
+    # pipe so the no-dependency guarantee still holds for non-interactive commands.
+    PV_PTY_ACTIVE=0
+    local -i pty_kind=0
+    if ((allow_interactive)); then
+        pv_get_pty_kind pty_kind
+        (( pty_kind > 0 )) && PV_PTY_ACTIVE=1
+    fi
+
+    # The command + args, safely re-quoted for the 'script -c' wrapper.
+    local cmd_quoted="${(j: :)${(q+)@}}"
+
     if [[ -n "$outfile" ]]; then
         _append_log_timestamp "$outfile" "$@"
         setopt localoptions nomonitor
-        coproc {
-            set -o pipefail
+        case $pty_kind in
+        0) coproc {     # `script` not found, interactive cmds won't work well
+            setopt pipefail
             command -- "$@" 2>&1 | tee -a "$outfile"
-        }
+           } ;;
+        1) coproc {     # linux version of `script`
+            setopt pipefail
+            script -qef -c "$cmd_quoted" /dev/null 2>&1 | tee -a "$outfile"
+           } ;;
+        2) coproc {     # BSD/macOS version of `script`
+            setopt pipefail
+            script -q /dev/null /bin/sh -c "exec \"\$@\"" sh "$@" 2>&1 | tee -a "$outfile"
+           } ;;
+        esac
     else
         setopt localoptions nomonitor
-        coproc {
+        case $pty_kind in
+        0) coproc {     # `script` not found, interactive cmds won't work well
             command -- "$@" 2>&1
-        }
+           } ;;
+        1) coproc {     # linux version of `script`
+            script -qef -c "$cmd_quoted" /dev/null 2>&1
+           } ;;
+        2) coproc {     # BSD/macOS version of `script`
+            script -q /dev/null /bin/sh -c "exec \"\$@\"" sh "$@" 2>&1
+           } ;;
+        esac
     fi
     PV_PID=$!
-    exec {PV_FD}<&p
+    exec {PV_FD_OUT}<&p
+    ((allow_interactive)) && exec {PV_FD_IN}>&p
 
-    trap 'pv_tput_rcsr; pv_tput_cnorm; echo' EXIT
-    trap 'pv_tput_rcsr; pv_tput_cnorm; echo; exit' INT TERM HUP QUIT
+    trap '_pv_exit_cleanup' EXIT
+    trap '_pv_record_signal 2' INT
+    trap '_pv_record_signal 15' TERM
+    trap '_pv_record_signal 1' HUP
+    trap '_pv_record_signal 3' QUIT
     pv_tput_civis
+
+    # In interactive mode, put main TTY into char-at-a-time, no-echo mode so we can
+    # relay each keystroke into the child and control our own echo. Save/restore it.
+    _pv_save_and_config_tty
+
+    if (( PV_SIGNAL )); then
+        _pv_restore_tty
+        trap - INT TERM HUP QUIT EXIT
+        return $((128 + PV_SIGNAL))
+    fi
 
     PV_INSIDE_TPUTCSR=0
     _start_popview $label
-    _process_popview $label
+    _process_popview "$label" "$allow_interactive"
 
-    # Clean up the fd, and wait (process is dead, so will be instant) to retrieve return code.
+    # First, restore TTY mode.
+    local -i signal_no=$PV_SIGNAL
+    if (( signal_no )); then
+        if [[ -n "$PV_FD_IN" ]]; then
+            exec {PV_FD_IN}>&-;                 PV_FD_IN=""
+        fi
+        kill -"$signal_no" "$PV_PID" 2>/dev/null
+    fi
+    _pv_restore_tty
+    # Clean up the FDs, and wait (process is dead, so will be instant) to retrieve return code.
+    if [[ -n "$PV_FD_IN" ]]; then
+        exec {PV_FD_IN}>&-;                 PV_FD_IN=""
+    fi
+    if [[ -n "$PV_FD_OUT" ]]; then
+        exec {PV_FD_OUT}<&-;                PV_FD_OUT=""
+    fi
     local -i rc
-    exec {PV_FD}<&-;    PV_FD=""
     wait $PV_PID;       rc=$?
-    PV_PID="";  PV_OUTBUF=""
+    (( signal_no )) && rc=$((128 + signal_no))
+    PV_PID=""
     if (( rc != 0 || PV_DEBUG_SKIP_CLOSE )); then
         # failure: leave scroll view visible since it hopefully has the failure details
         _end_popview_leave_open "$label" "$outfile" "$rc"

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Pretty, bounded, live-scrolling command execution for zsh.`pv_exec` is a single-file zsh function that runs your shell command inside a self-contained, fixed-height, bordered popup view. It streams the command's live output into the bordered popup view, shows a spinner while it runs, and then collapses everything down to a single ✓ success line if the command exits cleanly, or keeps the view open on failure so you can see what error occurred. Think of it as a mini `tail -f` window that opens, does its job, and visually tidies up after itself.
+Pretty, bounded, live-scrolling command execution for zsh.`pv_exec` is a single-file zsh function that runs your command inside a self-contained, fixed-height, bordered popup view. It streams the command's live output into the bordered popup view, shows a spinner while it runs, and then collapses everything down to a single ✓ success line if the command exits cleanly, or keeps the view open on failure so you can see what error occurred. Think of it as a mini `tail -f` window that opens, does its job, and visually tidies up after itself.
 
 Here is a simple example of using `pv_exec` to run a build script:
 
@@ -35,13 +35,12 @@ Existing progress and spinner tools/libraries didn't quite fit, so here we are.
 - **Optional file logging**  — saves all output with a timestamped header between runs (using argument `-o outfile`).
 - **Log file links** — renders clickable `file://` hyperlinks for log files in supported terminals (iTerm2, WezTerm, Kitty, etc.).
 - **Dark/light terminal aware** — auto chooses bright or dim colors schemes based on terminal background color.
-- **100% zsh** — for maintainability and transparency `pv_exec` is written in pure zsh with no 3rd party dependencies.
 - **Library or Command** — `source pv_exec` to use the `pv_exec` function from your own scripts, or run it directly as a standalone wrapper.
 ## Requirements
 
-- **zsh** 5.8 or newer (tested on 5.9). Script loads (via `zmodload`): `terminfo`, `datetime`, `zselect`.
+**zsh** 5.8 or newer (tested on 5.9). Script loads (via `zmodload`): `terminfo`, `datetime`, `zselect`. Other minimal dependencies commands used: `script`, `grep`, `tee`, `dirname`, `mkdir`, `date` (reduced functionality fallback if not found).
 
-No other dependencies. No Python, no `awk`/`sed` in hot paths, no 3rd party scripts or libraries.
+No other dependencies or 3rd party scripts/libraries are needed.
 ## Usage
 
 ### Library Function or Command:
@@ -77,15 +76,15 @@ The return code of `pv_exec` is the return code of the wrapped command.
 
 Before calling `pv_exec` you can set the following variables to customize the popup view appearance and behavior (all have sensible defaults):
 
-| Variable | Default | Description |
+| Variable | Default | Description                                                          |
 | --- | --- | --- |
-| `PV_ENABLE`               | `1`     | `0` to fall back to plain inline output (no popview)                |
-| `PV_WRAP_LINES`           | `1`     | `1` to wrap long lines at view width, `0` to hard-truncate          |
-| `PV_BORDER_SHOW`          | `1`     | `1` to draw the rounded border frame, `0` for plain indented output |
-| `PV_BORDER_ANIMATE_CLOSE` | `1`     | `1` to animate the close sequence, `0` to close instantly           |
-| `PV_MAX_HEIGHT`           | `13`    | Max number of output lines visible in the scroll view               |
-| `PV_LOG_TO_PADDING`       | `50`    | Column at which the "logged to: ..." link is aligned                |
-| `PV_CLOSE_PAUSE_DELAY`    | `1.75`  | Seconds to pause before closing the view on success                 |
+| `PV_ENABLE`               | `1`     | `0` to skip popview rendering (silent command execution) |
+| `PV_WRAP_LINES`           | `1`     | `1` to wrap long lines at view width, `0` to hard-truncate           |
+| `PV_BORDER_SHOW`          | `1`     | `1` to draw the rounded border frame, `0` for plain indented output  |
+| `PV_BORDER_ANIMATE_CLOSE` | `1`     | `1` to animate the close sequence, `0` to close instantly            |
+| `PV_MAX_HEIGHT`           | `13`    | Max number of output lines visible in the scroll view                |
+| `PV_LOG_TO_PADDING`       | `50`    | Column at which the "logged to: ..." link is aligned                 |
+| `PV_CLOSE_PAUSE_DELAY`    | `1.75`  | Seconds to pause before closing the view on success                  |
 
 ---
 ## Limitations / Known Quirks
