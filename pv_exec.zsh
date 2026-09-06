@@ -192,12 +192,19 @@ strip_control_chars() {
 
     local cleaned=${input//*$'\x0D'/}                  # Remove everything up to and including CR
 
-    cleaned=${cleaned//$'\033['[0-9;]#[a-zA-Z]/}       # Most CSI sequences
+    # CSI allows private parameters (e.g. ?25l, ?2026h), intermediates, and
+    # non-letter final bytes. None of these should reach the display terminal.
+    cleaned=${cleaned//$'\033['[0-?]#[\ -\/]#[@-~]/}
+    # A prompt fragment may end partway through a CSI sequence. Hide that suffix;
+    # PV_PENDING_FRAG retains the original bytes until the next read completes it.
+    cleaned=${cleaned%$'\033['[0-?]#[\ -\/]#}
+    cleaned=${cleaned%$'\033'}
     cleaned=${cleaned//$'\033'[a-zA-Z]/}               # Simple ESC sequences
     cleaned=${cleaned//$'\033'[0-9]/}                  # ESC + single digit
     cleaned=${cleaned//$'\033Y'??/}                    # VT52 cursor positioning
 
-    cleaned=${cleaned//$'\x9B'[0-9;]#[a-zA-Z]/}        # 8-bit CSI sequences
+    cleaned=${cleaned//$'\x9B'[0-?]#[\ -\/]#[@-~]/}   # 8-bit CSI sequences
+    cleaned=${cleaned%$'\x9B'[0-?]#[\ -\/]#}
     cleaned=${cleaned//[$'\x80'-$'\x8F'$'\x91'-$'\x98'$'\x9A'$'\x9E'-$'\x9F']/} # Single-byte C1
     cleaned=${cleaned//$'\007'/}                       # Bell character (BEL)
     cleaned=${cleaned//$'\b'/}                         # Unsupported cursor-left control (BS)
@@ -867,10 +874,11 @@ _paint_row() {
     local padleft_str=${(l:$PV_BORDER_MARGIN_LEFT:: :):""}
 
     if ((PV_BORDER_SHOW)); then
-        # Double-width safe right border trick (preserved): print left border + text
-        # with %-*s (may overshoot on wide chars), then force the cursor to the exact
-        # right-border column, draw it, and clear to end-of-line.
+        # Clear the old row (including the previous bottom border) independently
+        # of text padding: character count can differ from terminal column width.
+        # Position the right border explicitly so wide text cannot displace it.
         pv_tput_cup "$ypos" 0
+        pv_tput_el
         printf "%s${PROCESSING_TEXT_COLOR}│ ${LOG_TEXT_COLOR}%-*s " "$padleft_str" "$width" "$noesc_text"
         pv_tput_cup "$ypos" "$((PV_WIN_ORIG_WIDTH - PV_BORDER_MARGIN_RIGHT - 1))"
         print -n "${PROCESSING_TEXT_COLOR}│${PV_RESET}";    pv_tput_el
@@ -1211,7 +1219,7 @@ pv_init() {
     typeset -gi PV_BORDER_MARGIN_RIGHT=2       # 2 character margin on right border
     typeset -gi PV_LOG_TO_PADDING=50           # 50 character padding before rendering label "logged to: "
 
-    typeset -gi PV_DEBUG_SKIP_CLOSE=0          # if enabled scroll view is not closed (even if successful)
+    typeset -gi PV_DEBUG_SKIP_CLOSE=1          # if enabled scroll view is not closed (even if successful)
     typeset -gF PV_CLOSE_PAUSE_DELAY=1.75      # short pause before erasing and closing views
     typeset -gF PV_CLOSE_FRAME_DELAY=0.035     # delay between animation frames during view closing
 
