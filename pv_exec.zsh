@@ -711,6 +711,7 @@ _start_popview() {
     PV_CUR_HEIGHT=0
     PV_SCROLL_ON_NEXT_LN=0
     PV_ROW_PAINTED=0
+    PV_LAST_ROW_BLANK=1
     if [[ -n "$pending_frag" ]]; then
         local -i pending_width=$((PV_WIN_ORIG_WIDTH - PV_BORDER_MARGIN_LEFT - PV_BORDER_MARGIN_RIGHT - 4))
         _paint_row "$pending_frag" "$pending_width"
@@ -718,12 +719,45 @@ _start_popview() {
     return 0
 }
 
+# Return the visible height, removing one blank bottom row before final rendering.
+# Committed rows and the extra prompt row both count, but at full height they
+# share the same bottom row. Test the text recorded by _paint_row(), not the
+# pending input buffer, which may already have been cleared at EOF.
+_trim_popview_blank_row() {
+    local out_height=$1
+    local -i visible_height=$PV_CUR_HEIGHT
+    (( PV_CUR_HEIGHT < PV_MAX_HEIGHT && PV_ROW_PAINTED )) && ((visible_height++))
+    if (( visible_height > 0 && PV_LAST_ROW_BLANK )); then
+        ((visible_height--))
+        pv_start_buffered_update
+        if ((PV_BORDER_SHOW)); then
+            # Erase the old bottom border before moving it up over the blank row.
+            pv_tput_cup "$((PV_TOP_SCROLLREGION + visible_height + 1))" 0
+            pv_tput_el
+        fi
+        pv_tput_cup "$((PV_TOP_SCROLLREGION + visible_height))" 0
+        pv_tput_el
+        if ((PV_BORDER_SHOW)); then
+            if ((visible_height > 0)); then
+                print -n "$PV_BOT_BORDER_STR"
+            else
+                # No content remains: remove the top border as well.
+                pv_tput_cup "$((PV_TOP_SCROLLREGION - 1))" 0
+                pv_tput_el
+            fi
+        fi
+        pv_end_buffered_update
+    fi
+    : ${(P)out_height::="$visible_height"}
+    return 0
+}
+
 _end_popview_leave_open() {
     local label=$1
     local outfile=$2
     local rc=$3
-    local -i display_height=$PV_CUR_HEIGHT
-    (( PV_CUR_HEIGHT < PV_MAX_HEIGHT && PV_ROW_PAINTED )) && ((display_height++))
+    local -i display_height=0
+    _trim_popview_blank_row display_height
 
     pv_tput_cup $PV_TOP_ANCHOR 0
     if (( rc == 0 )); then
@@ -762,11 +796,13 @@ _end_popview_leave_open() {
 _end_popview_with_close() {
     local label=$1
     local outfile=$2
+    local -i close_height=0
+    _trim_popview_blank_row close_height
 
     pv_tput_cup $PV_TOP_ANCHOR 0
     _render_label_success "$label" "$outfile"
-    if ((PV_CUR_HEIGHT == 0)); then
-        return 0  # Nothing was ever rendered, so no cleanup needed.
+    if ((close_height == 0)); then
+        return 0  # No visible content remains to animate.
     fi
 
     pv_sleep $PV_CLOSE_PAUSE_DELAY
@@ -777,12 +813,6 @@ _end_popview_with_close() {
     fi
 
     if ((PV_BORDER_SHOW && PV_BORDER_ANIMATE_CLOSE)); then
-        # PV_CUR_HEIGHT counts committed rows. Before the frame is full, _paint_row()
-        # also leaves an uncommitted current row on screen after output ending in LF;
-        # include that row so the bottom border remains inside the closing scroll
-        # region. Once full, the current row is already the last row of the region.
-        local -i close_height=$PV_CUR_HEIGHT
-        (( PV_CUR_HEIGHT < PV_MAX_HEIGHT && PV_ROW_PAINTED )) && ((close_height++))
         PV_BOT_SCROLLREGION=$((PV_TOP_SCROLLREGION + close_height))
         pv_tput_csr "$PV_TOP_SCROLLREGION" "$PV_BOT_SCROLLREGION"; PV_INSIDE_TPUTCSR=1
         pv_tput_cup "$((PV_TOP_SCROLLREGION + close_height))" 0
@@ -800,7 +830,7 @@ _end_popview_with_close() {
         pv_tput_cup "$((PV_TOP_ANCHOR + 1))" 0;     pv_tput_el
     else
         local -i top=$((PV_TOP_ANCHOR + 1))
-        local -i bottom=$((PV_BOT_SCROLLREGION))
+        local -i bottom=$((PV_TOP_SCROLLREGION + close_height - 1))
         if ((PV_BORDER_SHOW)); then
             ((bottom++))
         fi
@@ -854,6 +884,8 @@ _paint_row() {
     local noesc_text=""
     strip_control_chars "$text" noesc_text
     ((${#noesc_text} > width)) && noesc_text="${noesc_text[1,$width]}"
+    PV_LAST_ROW_BLANK=0
+    [[ -z "${noesc_text//[[:space:]]/}" ]] && PV_LAST_ROW_BLANK=1
 
     pv_tput_rmam   # disable auto-wrapping of lines
     pv_start_buffered_update
@@ -1219,7 +1251,7 @@ pv_init() {
     typeset -gi PV_BORDER_MARGIN_RIGHT=2       # 2 character margin on right border
     typeset -gi PV_LOG_TO_PADDING=50           # 50 character padding before rendering label "logged to: "
 
-    typeset -gi PV_DEBUG_SKIP_CLOSE=1          # if enabled scroll view is not closed (even if successful)
+    typeset -gi PV_DEBUG_SKIP_CLOSE=0          # if enabled scroll view is not closed (even if successful)
     typeset -gF PV_CLOSE_PAUSE_DELAY=1.75      # short pause before erasing and closing views
     typeset -gF PV_CLOSE_FRAME_DELAY=0.035     # delay between animation frames during view closing
 
@@ -1234,6 +1266,7 @@ pv_init() {
     typeset -g PV_PENDING_FRAG=""               # trailing bytes with no newline yet (likley a prompt)
     typeset -gi PV_SCROLL_ON_NEXT_LN=0          # 1 when the next _paint_row() should scroll before next line
     typeset -gi PV_ROW_PAINTED=0                # 1 when the current row is painted but not yet committed
+    typeset -gi PV_LAST_ROW_BLANK=1             # Last painted row contains only whitespace/control codes
     typeset -gi PV_PTY_ACTIVE=0                 # 1 when child command runs under a PTY
     typeset -gi PV_PROMPT_STATE=0               # 0: command busy, 1: possible prompt (non-empty input frag), 2: active prompting
     typeset -gi PV_INPUT_ACTIVE=0               # user has typed but has not submitted the line
